@@ -5,7 +5,6 @@ Anthropic News Monitor - 抓取 Anthropic 最新新闻，AI 分析后写入 Noti
 from datetime import datetime, timezone
 import os
 import re
-import json
 import requests
 
 NOTION_TOKEN = os.environ.get("NOTION_TOKEN", "")
@@ -15,8 +14,10 @@ DATABASE_ID = os.environ.get("NOTION_DATABASE_ID", "")
 LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://api.openai.com/v1")
 LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4o-mini")
-# 如果 API 是 Anthropic 格式（非 OpenAI 兼容），设为 "anthropic"
 LLM_API_FORMAT = os.environ.get("LLM_API_FORMAT", "openai")
+
+# 每次最多抓取的文章数（避免一次触发太多 LLM 调用）
+MAX_ARTICLES_PER_RUN = 3
 
 NOTION_HEADERS = {
     "Authorization": f"Bearer {NOTION_TOKEN}",
@@ -25,55 +26,55 @@ NOTION_HEADERS = {
 }
 
 
-def get_latest_article():
-    """使用 Jina Reader 抓取 Anthropic 新闻页，解析最新一篇文章的标题和 URL"""
+def get_all_articles():
+    """使用 Jina Reader 抓取 Anthropic 新闻页，解析所有文章链接"""
     jina_url = "https://r.jina.ai/https://www.anthropic.com/news"
     response = requests.get(jina_url, timeout=30)
     if response.status_code != 200:
         raise Exception(f"Failed to fetch from Jina: {response.status_code}")
 
     raw_text = response.text
-    # Debug: 打印前 500 字符，方便排查格式变化
-    print(f"[DEBUG] Jina response (first 500 chars):\n{raw_text[:500]}")
-
-    article_title = None
-    article_link = None
+    articles = []
+    seen_urls = set()
 
     # 策略 1: 匹配 Markdown 链接 [/news/...](...)
     for line in raw_text.split("\n"):
         if "[/news/" in line:
-            m = re.search(r'\[([^\]]+)\]\((/news/\S+)\)', line)
+            m = re.search(r'\[([^\]]+)\]\((/news/[^\s)]+)\)', line)
             if m:
-                article_title = m.group(1)
-                article_link = f"https://www.anthropic.com{m.group(2)}"
-                break
+                url = f"https://www.anthropic.com{m.group(2)}"
+                title = m.group(1)
+                if url not in seen_urls:
+                    articles.append((title, url))
+                    seen_urls.add(url)
 
     # 策略 2: 匹配完整 URL 的 Markdown 链接
-    if not article_link:
+    if not articles:
         for line in raw_text.split("\n"):
             if "anthropic.com/news/" in line:
                 m = re.search(
-                    r'\[([^\]]+)\]\((https://www\.anthropic\.com/news/\S+)\)', line
+                    r'\[([^\]]+)\]\((https://www\.anthropic\.com/news/[^\s)]+)\)',
+                    line,
                 )
                 if m:
-                    article_title = m.group(1)
-                    article_link = m.group(2)
-                    break
+                    url = m.group(2)
+                    title = m.group(1)
+                    if url not in seen_urls:
+                        articles.append((title, url))
+                        seen_urls.add(url)
 
-    # 策略 3: 用正则直接搜 URL（不带 Markdown 包裹的情况）
-    if not article_link:
-        m = re.search(
+    # 策略 3: 用正则直接搜 URL
+    if not articles:
+        for m in re.finditer(
             r'https://www\.anthropic\.com/news/([^\s")]+)', raw_text
-        )
-        if m:
-            article_link = m.group(0)
-            # 标题取 URL 路径最后一段
-            article_title = m.group(1).rstrip("/").replace("-", " ")
-            # 清理
-            if ")" in article_title:
-                article_title = article_title.split(")")[0]
+        ):
+            url = m.group(0)
+            title = m.group(1).rstrip("/").replace("-", " ")
+            if url not in seen_urls:
+                articles.append((title, url))
+                seen_urls.add(url)
 
-    return article_title, article_link
+    return articles
 
 
 def is_already_recorded(url):
@@ -103,7 +104,6 @@ def analyze_article(article_url):
         f"https://r.jina.ai/{article_url}", timeout=30
     ).text
 
-    # 截取过长内容，避免 token 超限
     if len(article_content) > 15000:
         article_content = article_content[:15000] + "\n\n[内容已截断...]"
 
@@ -197,31 +197,45 @@ def write_to_notion(title, url, summary):
     }
     response = requests.post(create_url, headers=NOTION_HEADERS, json=payload)
     if response.status_code == 200:
-        print("Successfully written to Notion!")
+        print(f"  Written: {title}")
     else:
-        print(f"Failed to write to Notion: {response.status_code} {response.text}")
+        print(f"  Failed: {response.status_code} {response.text}")
 
 
 def main():
     try:
         print("Checking Anthropic News...")
-        title, url = get_latest_article()
+        articles = get_all_articles()
 
-        if not url:
-            print("No article found.")
+        if not articles:
+            print("No articles found.")
             return
 
-        print(f"Latest article found: {title} ({url})")
+        print(f"Found {len(articles)} articles on page")
 
-        if is_already_recorded(url):
-            print("Article already recorded in Notion. Skipping.")
-            return
+        processed = 0
+        new_count = 0
 
-        print("New article detected! Starting analysis...")
-        summary = analyze_article(url)
+        for title, url in articles:
+            if processed >= MAX_ARTICLES_PER_RUN:
+                print(f"Reached max articles limit ({MAX_ARTICLES_PER_RUN})")
+                break
 
-        print("Writing to Notion...")
-        write_to_notion(title, url, summary)
+            processed += 1
+            print(f"  [{processed}] {title}")
+
+            if is_already_recorded(url):
+                print(f"    Already recorded, skipping")
+                continue
+
+            print(f"    New article! Analyzing...")
+            summary = analyze_article(url)
+
+            print(f"    Writing to Notion...")
+            write_to_notion(title, url, summary)
+            new_count += 1
+
+        print(f"\nDone. Processed {processed} articles, {new_count} new entries written.")
 
     except Exception as e:
         print(f"Error occurred: {e}")
