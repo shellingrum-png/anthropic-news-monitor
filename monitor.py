@@ -2,6 +2,7 @@
 Anthropic News Monitor - 抓取 Anthropic 最新新闻，AI 分析后写入 Notion
 """
 
+from datetime import datetime, timezone
 import os
 import re
 import json
@@ -163,6 +164,7 @@ def _call_anthropic_api(prompt):
 
 def write_to_notion(title, url, summary):
     """将分析结果写入 Notion 数据库"""
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
     create_url = "https://api.notion.com/v1/pages"
     payload = {
         "parent": {"database_id": DATABASE_ID},
@@ -172,6 +174,7 @@ def write_to_notion(title, url, summary):
             "Summary": {
                 "rich_text": [{"type": "text", "text": {"content": summary[:2000]}}]
             },
+            "Date": {"date": {"start": now}},
         },
         "children": [
             {
