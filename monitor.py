@@ -3,6 +3,7 @@ Anthropic News Monitor - 抓取 Anthropic 最新新闻，AI 分析后写入 Noti
 """
 
 import os
+import re
 import json
 import requests
 
@@ -30,22 +31,46 @@ def get_latest_article():
     if response.status_code != 200:
         raise Exception(f"Failed to fetch from Jina: {response.status_code}")
 
-    lines = response.text.split("\n")
-    article_link = None
+    raw_text = response.text
+    # Debug: 打印前 500 字符，方便排查格式变化
+    print(f"[DEBUG] Jina response (first 500 chars):\n{raw_text[:500]}")
+
     article_title = None
+    article_link = None
 
-    # 寻找第一条形如 [Title](/news/xxx) 的 Markdown 链接
-    for line in lines:
-        if "(/news/" in line and "[" in line:
-            start_title = line.find("[") + 1
-            end_title = line.find("]")
-            start_url = line.find("(") + 1
-            end_url = line.find(")")
+    # 策略 1: 匹配 Markdown 链接 [/news/...](...)
+    for line in raw_text.split("\n"):
+        if "[/news/" in line:
+            m = re.search(r'\[([^\]]+)\]\((/news/\S+)\)', line)
+            if m:
+                article_title = m.group(1)
+                article_link = f"https://www.anthropic.com{m.group(2)}"
+                break
 
-            article_title = line[start_title:end_title]
-            relative_url = line[start_url:end_url]
-            article_link = f"https://www.anthropic.com{relative_url}"
-            break
+    # 策略 2: 匹配完整 URL 的 Markdown 链接
+    if not article_link:
+        for line in raw_text.split("\n"):
+            if "anthropic.com/news/" in line:
+                m = re.search(
+                    r'\[([^\]]+)\]\((https://www\.anthropic\.com/news/\S+)\)', line
+                )
+                if m:
+                    article_title = m.group(1)
+                    article_link = m.group(2)
+                    break
+
+    # 策略 3: 用正则直接搜 URL（不带 Markdown 包裹的情况）
+    if not article_link:
+        m = re.search(
+            r'https://www\.anthropic\.com/news/([^\s")]+)', raw_text
+        )
+        if m:
+            article_link = m.group(0)
+            # 标题取 URL 路径最后一段
+            article_title = m.group(1).rstrip("/").replace("-", " ")
+            # 清理
+            if ")" in article_title:
+                article_title = article_title.split(")")[0]
 
     return article_title, article_link
 
