@@ -1,5 +1,5 @@
 """
-Anthropic News Monitor - 抓取 Anthropic 最新新闻，AI 分析后写入 Notion
+AI News Monitor - 多源 AI 新闻抓取，AI 分析后写入 Notion
 """
 
 from datetime import datetime, timezone
@@ -16,8 +16,8 @@ LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://api.openai.com/v1")
 LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4o-mini")
 LLM_API_FORMAT = os.environ.get("LLM_API_FORMAT", "openai")
 
-# 每次最多抓取的文章数（避免一次触发太多 LLM 调用）
-MAX_ARTICLES_PER_RUN = 3
+# 每个源最多抓取的文章数（避免一次触发太多 LLM 调用）
+MAX_ARTICLES_PER_SOURCE = 2
 
 NOTION_HEADERS = {
     "Authorization": f"Bearer {NOTION_TOKEN}",
@@ -25,59 +25,96 @@ NOTION_HEADERS = {
     "Notion-Version": "2022-06-28",
 }
 
+# 新闻源配置
+SOURCES = [
+    {
+        "name": "Anthropic",
+        "url": "https://www.anthropic.com/news",
+    },
+    {
+        "name": "OpenAI",
+        "url": "https://openai.com/news",
+    },
+    {
+        "name": "Google DeepMind",
+        "url": "https://deepmind.google/discover",
+    },
+    {
+        "name": "TLDR AI",
+        "url": "https://tldr.tech/ai",
+    },
+    {
+        "name": "The Batch (吴恩达)",
+        "url": "https://www.deeplearning.ai/the-batch",
+    },
+    {
+        "name": "量子位",
+        "url": "https://www.qbitai.com",
+    },
+    {
+        "name": "机器之心",
+        "url": "https://www.jiqizhixin.com",
+    },
+]
 
-def get_all_articles():
-    """使用 Jina Reader 抓取 Anthropic 新闻页，解析所有文章链接"""
-    jina_url = "https://r.jina.ai/https://www.anthropic.com/news"
-    response = requests.get(jina_url, timeout=30)
-    if response.status_code != 200:
-        raise Exception(f"Failed to fetch from Jina: {response.status_code}")
+
+def fetch_source_articles(source):
+    """抓取单个源的文章列表"""
+    jina_url = f"https://r.jina.ai/{source['url']}"
+    try:
+        response = requests.get(jina_url, timeout=30)
+        if response.status_code != 200:
+            print(f"  [!] Failed to fetch {source['name']}: HTTP {response.status_code}")
+            return []
+    except requests.RequestException as e:
+        print(f"  [!] Failed to fetch {source['name']}: {e}")
+        return []
 
     raw_text = response.text
     articles = []
     seen_urls = set()
 
-    # 策略 1: 匹配 Markdown 链接 [/news/...](...)
-    for line in raw_text.split("\n"):
-        m = re.search(r'\[([^\]]+)\]\((/news/[^\s)]+)\)', line)
-        if m:
-            # 标题行通常在列表项中（以 * 或 # 开头）
-            stripped = line.strip()
-            if stripped.startswith('*') or stripped.startswith('#'):
-                url = f"https://www.anthropic.com{m.group(2)}"
-                title = m.group(1).strip()
-                if url not in seen_urls:
-                    articles.append((title, url))
-                    seen_urls.add(url)
+    # 提取所有 Markdown 链接 [Title](URL)
+    for m in re.finditer(r'\[([^\]]{3,})\]\((https?://[^\s)]+)\)', raw_text):
+        title = m.group(1).strip()
+        url = m.group(2).split("?")[0]  # 去掉 query params
 
-    # 策略 2: 匹配完整 URL 的 Markdown 链接
-    if not articles:
-        for line in raw_text.split("\n"):
-            m = re.search(
-                r'\[([^\]]+)\]\((https://www\.anthropic\.com/news/[^\s)]+)\)',
-                line,
-            )
-            if m:
-                stripped = line.strip()
-                if stripped.startswith('*') or stripped.startswith('#'):
-                    url = m.group(2).split('?')[0]
-                    title = m.group(1).strip()
-                    if url not in seen_urls:
-                        articles.append((title, url))
-                        seen_urls.add(url)
+        # 过滤掉导航链接、锚点链接、图片链接等
+        if (
+            len(title) < 5
+            or len(title) > 200
+            or url.startswith("#")
+            or ".png" in url
+            or ".jpg" in url
+            or ".gif" in url
+            or "mailto:" in url
+            or "javascript:" in url
+            or "tel:" in url
+        ):
+            continue
 
-    # 策略 3: 用正则直接搜 URL
+        if url not in seen_urls:
+            articles.append((title, url))
+            seen_urls.add(url)
+
+    # 如果正则没匹配到，尝试找纯 URL
     if not articles:
         for m in re.finditer(
-            r'https://www\.anthropic\.com/news/([^\s")]+)', raw_text
+            r"https://[a-z0-9.-]+\.[a-z]{2,}(/[^\s\"')]+)?", raw_text
         ):
-            url = m.group(0).split('?')[0]
-            title = m.group(1).rstrip("/").replace("-", " ")
+            url = m.group(0)
+            # 跳过常见非文章链接
+            if any(
+                skip in url
+                for skip in [".png", ".jpg", ".gif", "mailto:", "javascript:"]
+            ):
+                continue
+            title = url.split("/")[-1].replace("-", " ").replace("_", " ")
             if url not in seen_urls:
                 articles.append((title, url))
                 seen_urls.add(url)
 
-    return articles
+    return articles[:MAX_ARTICLES_PER_SOURCE]
 
 
 def is_already_recorded(url):
@@ -165,20 +202,24 @@ def _call_anthropic_api(prompt):
         raise Exception(f"LLM API failed: {response.status_code} {response.text}")
 
 
-def write_to_notion(title, url, summary):
+def write_to_notion(title, url, summary, source=""):
     """将分析结果写入 Notion 数据库"""
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
     create_url = "https://api.notion.com/v1/pages"
+    props = {
+        "Title": {"title": [{"text": {"content": title}}]},
+        "URL": {"url": url},
+        "Summary": {
+            "rich_text": [{"type": "text", "text": {"content": summary[:2000]}}]
+        },
+        "Date": {"date": {"start": now}},
+    }
+    if source:
+        props["Source"] = {"select": {"name": source}}
+
     payload = {
         "parent": {"database_id": DATABASE_ID},
-        "properties": {
-            "Title": {"title": [{"text": {"content": title}}]},
-            "URL": {"url": url},
-            "Summary": {
-                "rich_text": [{"type": "text", "text": {"content": summary[:2000]}}]
-            },
-            "Date": {"date": {"start": now}},
-        },
+        "properties": props,
         "children": [
             {
                 "object": "block",
@@ -200,45 +241,37 @@ def write_to_notion(title, url, summary):
     }
     response = requests.post(create_url, headers=NOTION_HEADERS, json=payload)
     if response.status_code == 200:
-        print(f"  Written: {title}")
+        print(f"  Written: {title[:60]}...")
     else:
         print(f"  Failed: {response.status_code} {response.text}")
 
 
 def main():
     try:
-        print("Checking Anthropic News...")
-        articles = get_all_articles()
+        total_new = 0
+        total_seen = 0
 
-        if not articles:
-            print("No articles found.")
-            return
+        for source in SOURCES:
+            print(f"\nFetching: {source['name']} ({source['url']})")
+            articles = fetch_source_articles(source)
+            print(f"  Found {len(articles)} articles")
 
-        print(f"Found {len(articles)} articles on page")
+            for title, url in articles:
+                if is_already_recorded(url):
+                    print(f"    Already recorded: {title[:60]}...")
+                    total_seen += 1
+                    continue
 
-        processed = 0
-        new_count = 0
+                print(f"    New: {title[:60]}...")
+                try:
+                    summary = analyze_article(url)
+                    write_to_notion(title, url, summary, source=source["name"])
+                    total_new += 1
+                except Exception as e:
+                    print(f"    Error processing: {e}")
 
-        for title, url in articles:
-            if processed >= MAX_ARTICLES_PER_RUN:
-                print(f"Reached max articles limit ({MAX_ARTICLES_PER_RUN})")
-                break
-
-            processed += 1
-            print(f"  [{processed}] {title}")
-
-            if is_already_recorded(url):
-                print(f"    Already recorded, skipping")
-                continue
-
-            print(f"    New article! Analyzing...")
-            summary = analyze_article(url)
-
-            print(f"    Writing to Notion...")
-            write_to_notion(title, url, summary)
-            new_count += 1
-
-        print(f"\nDone. Processed {processed} articles, {new_count} new entries written.")
+        print(f"\n{'='*50}")
+        print(f"Done. {total_new} new entries written, {total_seen} already recorded.")
 
     except Exception as e:
         print(f"Error occurred: {e}")
