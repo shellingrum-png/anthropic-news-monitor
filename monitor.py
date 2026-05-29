@@ -39,11 +39,13 @@ def get_all_articles():
 
     # 策略 1: 匹配 Markdown 链接 [/news/...](...)
     for line in raw_text.split("\n"):
-        if "[/news/" in line:
-            m = re.search(r'\[([^\]]+)\]\((/news/[^\s)]+)\)', line)
-            if m:
+        m = re.search(r'\[([^\]]+)\]\((/news/[^\s)]+)\)', line)
+        if m:
+            # 标题行通常在列表项中（以 * 或 # 开头）
+            stripped = line.strip()
+            if stripped.startswith('*') or stripped.startswith('#'):
                 url = f"https://www.anthropic.com{m.group(2)}"
-                title = m.group(1)
+                title = m.group(1).strip()
                 if url not in seen_urls:
                     articles.append((title, url))
                     seen_urls.add(url)
@@ -51,14 +53,15 @@ def get_all_articles():
     # 策略 2: 匹配完整 URL 的 Markdown 链接
     if not articles:
         for line in raw_text.split("\n"):
-            if "anthropic.com/news/" in line:
-                m = re.search(
-                    r'\[([^\]]+)\]\((https://www\.anthropic\.com/news/[^\s)]+)\)',
-                    line,
-                )
-                if m:
-                    url = m.group(2)
-                    title = m.group(1)
+            m = re.search(
+                r'\[([^\]]+)\]\((https://www\.anthropic\.com/news/[^\s)]+)\)',
+                line,
+            )
+            if m:
+                stripped = line.strip()
+                if stripped.startswith('*') or stripped.startswith('#'):
+                    url = m.group(2).split('?')[0]
+                    title = m.group(1).strip()
                     if url not in seen_urls:
                         articles.append((title, url))
                         seen_urls.add(url)
@@ -68,7 +71,7 @@ def get_all_articles():
         for m in re.finditer(
             r'https://www\.anthropic\.com/news/([^\s")]+)', raw_text
         ):
-            url = m.group(0)
+            url = m.group(0).split('?')[0]
             title = m.group(1).rstrip("/").replace("-", " ")
             if url not in seen_urls:
                 articles.append((title, url))
