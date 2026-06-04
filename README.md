@@ -5,9 +5,11 @@
 ## 功能
 
 - 每天定时抓取多个 AI 新闻源的最新文章
+- **双抓取模式**：优先使用 Jina AI，失败时自动降级到直接 HTML 抓取
 - 通过 Notion API 按 URL 去重，避免重复分析
 - 调用 LLM（OpenAI 格式或 Anthropic 格式兼容）进行中文分析
 - 将分析结果写入 Notion 数据库，按来源分类
+- 完善的异常处理和重试机制
 
 ## 监控源
 
@@ -39,9 +41,16 @@
 
 前往 [developers.notion.com](https://developers.notion.com) 创建 Integration，获取 `Internal Integration Token`，并将其关联到上述数据库。
 
-### 3. 配置 GitHub Secrets
+### 3. 配置环境变量
 
-在 GitHub 仓库的 **Settings → Secrets and variables → Actions** 中添加：
+复制 `.env.example` 为 `.env` 并填写：
+
+```bash
+cp .env.example .env
+# 编辑 .env 文件
+```
+
+或在 GitHub Secrets 中配置：
 
 | Secret 名称 | 说明 |
 |-------------|------|
@@ -57,12 +66,7 @@
 ```bash
 pip install -r requirements.txt
 
-export NOTION_TOKEN="your_token"
-export NOTION_DATABASE_ID="your_database_id"
-export LLM_API_KEY="your_key"
-export LLM_BASE_URL="https://api.openai.com/v1"
-export LLM_MODEL="gpt-4o-mini"
-
+# 配置好 .env 后运行
 python monitor.py
 ```
 
@@ -76,6 +80,7 @@ SOURCES = [
     {
         "name": "Hacker News",
         "url": "https://news.ycombinator.com/news",
+        "link_pattern": r"/item\?id=\d+$",  # 可选，用于过滤链接
     },
 ]
 ```
@@ -83,3 +88,15 @@ SOURCES = [
 ## 手动触发
 
 在 GitHub 仓库的 **Actions → Daily AI Monitor → Run workflow** 点击按钮即可手动运行。
+
+## 更新日志
+
+### v2.0 主要改进
+
+- ✅ **双抓取模式**：Jina AI + 直接 HTML 抓取，自动降级
+- ✅ **重试机制**：网络请求失败自动重试 2 次
+- ✅ **异常处理**：单篇文章失败不影响整体流程
+- ✅ **详细日志**：清晰的成功/失败状态输出
+- ✅ **.env 支持**：本地调试更方便
+- ✅ **链接过滤**：每个源可配置独立的链接匹配规则
+- ✅ **超时优化**：避免单个请求卡住整个流程
