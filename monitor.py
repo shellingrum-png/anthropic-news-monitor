@@ -28,7 +28,7 @@ LLM_API_FORMAT = os.environ.get("LLM_API_FORMAT", "openai")
 MAX_ARTICLES_PER_SOURCE = 3
 
 # 抓取重试配置
-FETCH_TIMEOUT = 45
+FETCH_TIMEOUT = 15
 FETCH_RETRY_COUNT = 2
 
 NOTION_HEADERS = {
@@ -55,6 +55,8 @@ SOURCES = [
         "name": "OpenAI",
         "url": "https://openai.com/news",
         "link_pattern": r"/news/[a-z0-9-]+$",
+        # OpenAI 用 h3 当标题，在链接附近找标题
+        "title_nearby": r'<h[2-4][^>]*>([^<]{5,})</h',
     },
     {
         "name": "Google DeepMind",
@@ -75,6 +77,7 @@ SOURCES = [
         "name": "量子位",
         "url": "https://www.qbitai.com",
         "link_pattern": r"/\d+/.*\.html$",
+        "title_nearby": 'title=[\x27\"]([^\x27\"]{10,})[\x27\"]',  # 从 a 标签的 title 属性取
     },
     {
         "name": "机器之心",
@@ -100,8 +103,107 @@ def fetch_with_retry(url, headers=None, timeout=FETCH_TIMEOUT, retries=FETCH_RET
     raise last_error or Exception("Unknown error")
 
 
-def extract_article_links(html, base_url, source_name):
-    """提取文章链接"""
+def extract_article_links(html, base_url, source_name, source_config=None):
+    """提取文章链接 - 支持多种页面结构和源定制配置"""
+    articles = []
+    seen_urls = set()
+    title_nearby_pattern = source_config.get('title_nearby') if source_config else None
+
+    # 1. 先试 r.jina.ai 格式（Markdown 链接）
+    for m in re.finditer(r'\[([^\]]{5,})\]\((https?://[^\s)]+)\)', html):
+        title = m.group(1).strip()
+        url = m.group(2).split("?")[0]
+        if is_valid_article_link(url, title, base_url) and url not in seen_urls:
+            articles.append((title, url))
+            seen_urls.add(url)
+
+    # 2. 通用 HTML 链接提取（支持现代前端渲染）
+    # 遍历所有 a 标签
+    for a_match in re.finditer(r'<a[^>]+>', html, re.IGNORECASE):
+        a_tag = a_match.group(0)
+        
+        # 提取 href
+        href_match = re.search(r'href=["\']([^"\']+)["\']', a_tag, re.IGNORECASE)
+        if not href_match:
+            continue
+        
+        href = href_match.group(1)
+        
+        # 跳过锚点和JS
+        if href.startswith('#') or href.startswith('javascript:') or href.startswith('mailto:'):
+            continue
+        
+        # 处理相对路径和绝对路径
+        if href.startswith('http'):
+            url = href.split("?")[0]
+        elif href.startswith('/'):
+            url = urljoin(base_url, href).split("?")[0]
+        else:
+            continue
+        
+        if url in seen_urls:
+            continue
+        
+        # 尝试提取标题
+        title = None
+        
+        # 方式1: 从 alt 属性（图片链接）
+        alt_match = re.search(r'alt=["\']([^"\']+)["\']', a_tag, re.IGNORECASE)
+        if alt_match and len(alt_match.group(1)) > 3:
+            title = alt_match.group(1).strip()
+        
+        # 方式2: 匹配完整的 <a...>text</a> 结构
+        if not title:
+            a_full_pattern = re.escape(a_tag) + r'([^<]{4,})</a>'
+            a_full_match = re.search(a_full_pattern, html[a_match.start():a_match.start() + 1000], re.IGNORECASE | re.DOTALL)
+            if a_full_match:
+                text = re.sub(r'<[^>]+>', '', a_full_match.group(1)).strip()
+                if len(text) > 3:
+                    title = text
+        
+        # 方式3: 从 a 标签后面的标题标签 (h2/h3/h4)
+        if not title:
+            pos = a_match.end()
+            nearby = html[pos:pos + 500]
+            heading_match = re.search(r'<h[2-4][^>]*>([^<]+)</h', nearby, re.IGNORECASE)
+            if heading_match:
+                title = heading_match.group(1).strip()
+        
+        # 方式4: 从 aria-label
+        if not title:
+            aria_match = re.search(r'aria-label=["\']([^"\']+)["\']', a_tag, re.IGNORECASE)
+            if aria_match and len(aria_match.group(1)) > 3:
+                title = aria_match.group(1).strip()
+        
+        # 方式5: 从 URL 推导标题（过滤掉 .html 等后缀）
+        if not title:
+            path = url.rstrip('/').split('/')[-1]
+            path = re.sub(r'\.(html|htm|php|jsp)$', '', path, flags=re.IGNORECASE)
+            if path and len(path) > 3 and not path.isdigit():
+                title = path.replace('-', ' ').replace('_', ' ').title()
+            else:
+                # 如果是数字ID，尝试从页面其他位置找标题
+                continue
+        
+        # 清理标题（移除日期前缀、多余空格）
+        title = re.sub(r'^[A-Z][a-z]{2} \d{1,2},? \d{4}\s*', '', title)  # 移除 "Jun 1, 2026"
+        title = re.sub(r'^(Announcements|Research|News)\s*', '', title)  # 移除分类前缀
+        title = title.strip()
+        
+        # 方式6: 使用源配置的定制化标题提取模式
+        if (not title or len(title) < 5) and title_nearby_pattern:
+            nearby_pos = a_match.start()
+            nearby = html[max(0, nearby_pos - 200):nearby_pos + 500]
+            nearby_match = re.search(title_nearby_pattern, nearby)
+            if nearby_match:
+                title = nearby_match.group(1).strip()
+        
+        # 验证并添加
+        if len(title) >= 5 and is_valid_article_link(url, title, base_url) and url not in seen_urls:
+            articles.append((title, url))
+            seen_urls.add(url)
+
+    return articles
     articles = []
     seen_urls = set()
 
