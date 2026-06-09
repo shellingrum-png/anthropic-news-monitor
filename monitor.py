@@ -440,7 +440,8 @@ def write_to_notion(title, url, summary, source=""):
     }
     response = requests.post(create_url, headers=NOTION_HEADERS, json=payload, timeout=30)
     if response.status_code == 200:
-        print(f"    ✓ 已写入: {title[:60]}...")
+        resp = response.json()
+        print(f"    ✓ 已写入: {title[:60]}... (page_id: {resp.get('id', '?')})")
         return True
     else:
         print(f"    ✗ 写入失败: {response.status_code} {response.text[:200]}")
@@ -456,6 +457,7 @@ def main():
         print("=" * 60)
         print("AI News Monitor 启动")
         print(f"时间:", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        print(f"数据库ID: {DATABASE_ID}")
         print("=" * 60)
 
         for source in SOURCES:
