@@ -1,0 +1,155 @@
+name: 知识收集箱自动分析
+
+on:
+  schedule:
+    # 北京时间 9:00 / 14:00 / 20:00 (UTC 1:00 / 6:00 / 12:00)
+    - cron: '0 1,6,12 * * *'
+  workflow_dispatch:  # 支持手动触发
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安装依赖
+        run: pip install requests
+
+      - name: 运行知识分析脚本
+        env:
+          NOTION_API_KEY: ${{ secrets.NOTION_TOKEN }}
+          NOTION_DB_ID: "3811def7530c812d9cdfee036ae9320a"
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
+          LLM_MODEL: ${{ secrets.LLM_MODEL }}
+        run: |
+          python3 << 'PYEOF'
+          import json, os, sys, requests
+          from datetime import datetime
+
+          NOTION_TOKEN = os.environ['NOTION_API_KEY']
+          NOTION_DB_ID = os.environ['NOTION_DB_ID']
+          LLM_API_KEY = os.environ['LLM_API_KEY']
+          LLM_BASE_URL = os.environ['LLM_BASE_URL']
+          LLM_MODEL = os.environ['LLM_MODEL']
+
+          NOTION_HEADERS = {
+              'Authorization': f'Bearer {NOTION_TOKEN}',
+              'Notion-Version': '2022-06-28',
+              'Content-Type': 'application/json',
+          }
+
+          CATEGORIES = ['学习笔记', '训练体系', '工作项目', '文学创作', 'AI技术情报', 'AI研究与实践', '其他']
+
+          def get_pending_items():
+              url = f'https://api.notion.com/v1/databases/{NOTION_DB_ID}/query'
+              payload = {'filter': {'property': '状态', 'select': {'equals': '待分析'}}, 'page_size': 20}
+              resp = requests.post(url, headers=NOTION_HEADERS, json=payload)
+              resp.raise_for_status()
+              return resp.json().get('results', [])
+
+          def extract_content(item):
+              props = item.get('properties', {})
+              title = ''
+              title_prop = props.get('知识标题', {})
+              if title_prop.get('title'):
+                  title = title_prop['title'][0].get('plain_text', '')
+              content = ''
+              content_prop = props.get('内容', {})
+              if content_prop.get('rich_text'):
+                  content = ''.join(t.get('plain_text', '') for t in content_prop['rich_text'])
+              url = ''
+              url_prop = props.get('来源URL', {})
+              if url_prop.get('url'):
+                  url = url_prop['url']
+              return {'id': item['id'], 'title': title, 'content': content, 'url': url}
+
+          def analyze_content(item_data):
+              text = f'标题：{item_data["title"]}\n内容：{item_data["content"]}'
+              if item_data['url']:
+                  text += f'\n来源：{item_data["url"]}'
+              prompt = f'''你是一个知识库助手，请分析以下内容并将其分类。
+
+          内容：
+          {text}
+
+          请返回 JSON 格式的结果（只返回 JSON，不要其他文字）：
+          {{
+            "category": "从以下选项中选择一个最匹配的分类：{', '.join(CATEGORIES)}",
+            "summary": "用一句话概括这条知识的核心价值（50字以内）",
+            "tags": ["标签1", "标签2", "标签3"],
+            "confidence": 0.9
+          }}
+
+          分类说明：
+          - 学习笔记：学习方法、读书心得、课程笔记等
+          - 训练体系：BJJ训练方法、技术体系、体能训练等
+          - 工作项目：产品研发、项目管理、商业分析等
+          - 文学创作：写作技巧、文学评论、创作灵感等
+          - AI技术情报：AI产品发布、技术突破、行业动态等
+          - AI研究与实践：AI论文、算法研究、技术实践等
+          - 其他：无法归入以上分类的内容
+          '''
+              resp = requests.post(
+                  f'{LLM_BASE_URL}/chat/completions',
+                  headers={'Authorization': f'Bearer {LLM_API_KEY}', 'Content-Type': 'application/json'},
+                  json={'model': LLM_MODEL, 'messages': [{'role': 'user', 'content': prompt}], 'temperature': 0.3, 'max_tokens': 500},
+                  timeout=60,
+              )
+              resp.raise_for_status()
+              result = resp.json()
+              content_text = result['choices'][0]['message']['content']
+              json_start = content_text.find('{')
+              json_end = content_text.rfind('}') + 1
+              if json_start >= 0 and json_end > json_start:
+                  return json.loads(content_text[json_start:json_end])
+              return {'category': '其他', 'summary': content_text[:100], 'tags': [], 'confidence': 0.5}
+
+          def update_notion_item(item_id, analysis):
+              url = f'https://api.notion.com/v1/pages/{item_id}'
+              tags = analysis.get('tags', [])[:5]
+              payload = {
+                  'properties': {
+                      '分类': {'select': {'name': analysis.get('category', '其他')}},
+                      '摘要': {'rich_text': [{'text': {'content': analysis.get('summary', '')}}]},
+                      '状态': {'select': {'name': '已分类' if analysis.get('confidence', 0) > 0.7 else '需人工确认'}},
+                      '标签': {'multi_select': [{'name': tag} for tag in tags]},
+                  }
+              }
+              resp = requests.patch(url, headers=NOTION_HEADERS, json=payload)
+              resp.raise_for_status()
+
+          print(f'开始扫描知识收集箱... {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
+          items = get_pending_items()
+          if not items:
+              print('没有待分析的条目')
+              sys.exit(0)
+          print(f'找到 {len(items)} 条待分析内容')
+          stats = {'success': 0, 'needs_review': 0, 'failed': 0}
+          for item in items:
+              item_data = extract_content(item)
+              title = item_data['title'] or '(无标题)'
+              print(f'分析: {title[:50]}...')
+              analysis = analyze_content(item_data)
+              category = analysis.get('category', '其他')
+              confidence = analysis.get('confidence', 0)
+              print(f'  -> 分类: {category} (置信度: {confidence:.0%})')
+              print(f'  -> 摘要: {analysis.get("summary", "")[:60]}')
+              try:
+                  update_notion_item(item_data['id'], analysis)
+                  if confidence > 0.7:
+                      stats['success'] += 1
+                      print('  -> 已自动分类')
+                  else:
+                      stats['needs_review'] += 1
+                      print('  -> 置信度低，需人工确认')
+              except Exception as e:
+                  stats['failed'] += 1
+                  print(f'  -> 更新失败: {e}')
+          print(f'统计: 自动分类={stats["success"]}, 需确认={stats["needs_review"]}, 失败={stats["failed"]}')
+          PYEOF
