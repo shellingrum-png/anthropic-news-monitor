@@ -37,7 +37,7 @@ def fetch_with_retry(url, headers=None, timeout=FETCH_TIMEOUT, retries=2):
             response = requests.get(url, headers=headers, timeout=timeout)
             if response.status_code == 200:
                 return response
-            last_error = Exception(f"HTTP {response.status_code}")
+            last_error = Exception("HTTP {}".format(response.status_code))
         except requests.RequestException as e:
             last_error = e
         if i < retries:
@@ -49,35 +49,34 @@ def extract_article_links(html, base_url, source_config=None):
     seen_urls = set()
     link_pattern = source_config.get("link_pattern") if source_config else None
     if link_pattern:
-        base_path_pattern = re.compile(r'["\'](/news/[a-z0-9-]+)["\']', re.IGNORECASE)
-        for m in base_path_pattern.finditer(html):
-            path = m.group(1).strip()
+        all_links = re.findall(r"/news/[a-z0-9-]+", html, re.IGNORECASE)
+        for path in all_links:
             if re.match(link_pattern, path):
                 url = urljoin(base_url, path).split("?")[0]
                 if url not in seen_urls:
                     title = path.split("/")[-1].replace("-", " ").title()
-                    title = re.sub(r'\d+', '', title).strip()
+                    title = re.sub(r"\d+", "", title).strip()
                     if len(title) > 5:
                         articles.append((title, url))
                         seen_urls.add(url)
     unique_articles = []
     seen_titles = set()
     for title, url in articles:
-        clean_title = re.sub(r'\W+', '', title).lower()
+        clean_title = re.sub(r"\W+", "", title).lower()
         if clean_title not in seen_titles and len(clean_title) > 5:
             seen_titles.add(clean_title)
             unique_articles.append((title, url))
     return unique_articles
 
 def fetch_source_articles(source):
-    print(f"\n📡 正在抓取: {source['icon']} {source['name']}")
+    print("\n📡 正在抓取: {} {}".format(source["icon"], source["name"]))
     articles = []
     try:
-        response = fetch_with_retry(source['url'], timeout=FETCH_TIMEOUT)
-        articles = extract_article_links(response.text, source['url'], source)
-        print(f"✅ 抓取成功: 找到 {len(articles)} 篇文章")
+        response = fetch_with_retry(source["url"], timeout=FETCH_TIMEOUT)
+        articles = extract_article_links(response.text, source["url"], source)
+        print("✅ 抓取成功: 找到 {} 篇文章".format(len(articles)))
     except Exception as e:
-        print(f"❌ 抓取失败: {e}")
+        print("❌ 抓取失败: {}".format(e))
         return []
     return articles[:MAX_ARTICLES_PER_SOURCE]
 
@@ -92,7 +91,7 @@ def is_already_recorded(url):
         )
         return len(response["results"]) > 0
     except Exception as e:
-        print(f"⚠️  Notion 查询失败: {e}")
+        print("⚠️  Notion 查询失败: {}".format(e))
         return False
 
 def create_notion_page(title, source, url):
@@ -102,14 +101,14 @@ def create_notion_page(title, source, url):
                 "title": [
                     {
                         "text": {
-                            "content": f"{source['icon']} {title[:2000]}"
+                            "content": "{} {}".format(source["icon"], title[:2000])
                         }
                     }
                 ]
             },
             "Source": {
                 "select": {
-                    "name": source['name']
+                    "name": source["name"]
                 }
             },
             "URL": {
@@ -130,11 +129,11 @@ def create_notion_page(title, source, url):
             parent={"database_id": NOTION_DATABASE_ID},
             properties=properties
         )
-        print(f"✅ 同步成功: {title}")
+        print("✅ 同步成功: {}".format(title))
         return True
     except Exception as e:
-        print(f"❌ 同步失败: {title}")
-        print(f"   错误信息: {str(e)[:200]}")
+        print("❌ 同步失败: {}".format(title))
+        print("   错误信息: {}".format(str(e)[:200]))
         return False
 
 def main():
@@ -146,26 +145,15 @@ def main():
         articles = fetch_source_articles(source)
         for title, url in articles:
             if is_already_recorded(url):
-                print(f"ℹ️  已存在，跳过: {title}")
+                print("ℹ️  已存在，跳过: {}".format(title))
                 total_skipped += 1
                 continue
             if create_notion_page(title, source, url):
                 total_synced += 1
     print("\n" + "=" * 50)
     print("🎉 全部同步完成！")
-    print(f"✅ 新增: {total_synced} 篇资讯")
-    print(f"ℹ️  跳过: {total_skipped} 篇（已存在）")
+    print("✅ 新增: {} 篇资讯".format(total_synced))
+    print("ℹ️  跳过: {} 篇（已存在）".format(total_skipped))
 
 if __name__ == "__main__":
     main()
-EOF && \
-# 确认ssh连接正常
-ssh -T git@github.com -o StrictHostKeyChecking=no 2>&1 | grep "successfully authenticated" && \
-# 强制提交推送
-git add monitor.py && \
-git commit -m "fix: 100%纯净版本，无任何语法错误，彻底修复之前的污染问题" --no-verify && \
-git push -f origin main && \
-echo "✅ 推送成功！现在远程文件已经是正确版本了！" && \
-# 触发同步
-gh workflow run "Daily Anthropic Monitor" && \
-echo "🚀 同步任务已经触发，查看运行状态：https://github.com/shellingrum-png/anthropic-news-monitor/actions"
