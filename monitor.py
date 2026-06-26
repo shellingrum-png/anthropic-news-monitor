@@ -97,7 +97,7 @@ def is_already_recorded(url):
 def create_notion_page(title, source, url):
     try:
         properties = {
-            "Name": {
+            "Title": {
                 "title": [
                     {
                         "text": {
