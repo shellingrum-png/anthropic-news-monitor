@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import time
 import requests
 from urllib.parse import urljoin
@@ -12,8 +13,14 @@ load_dotenv()
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
 NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID")
 
+# LLM config
+LLM_API_KEY = os.getenv("LLM_API_KEY", "")
+LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
+LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
+
 FETCH_TIMEOUT = 30
 MAX_ARTICLES_PER_SOURCE = 20
+SUMMARY_MAX_CHARS = 2000
 
 SOURCES = [
     {
@@ -91,10 +98,87 @@ def is_already_recorded(url):
         )
         return len(response["results"]) > 0
     except Exception as e:
-        print("⚠️  Notion 查询失败: {}".format(e))
+        print("️  Notion 查询失败: {}".format(e))
         return False
 
-def create_notion_page(title, source, url):
+def fetch_article_content(url):
+    """通过 Jina AI Reader 抓取文章正文，失败时降级到直接请求"""
+    # 优先用 Jina AI Reader（返回 Markdown）
+    jina_url = "https://r.jina.ai/{}".format(url)
+    try:
+        resp = requests.get(jina_url, timeout=20)
+        if resp.status_code == 200 and resp.text.strip():
+            text = resp.text.strip()
+            # 去掉 Jina 自动加的首行 title 和 URL 元信息
+            lines = text.split("\n")
+            # 跳过前两行（通常是标题行和 URL 行）
+            if len(lines) > 2 and lines[0].startswith("#"):
+                content = "\n".join(lines[2:])
+            else:
+                content = text
+            if len(content) > 50:
+                print("   📖 通过 Jina 抓取成功 ({} chars)".format(len(content)))
+                return content[:10000]  # 截断避免 token 过多
+    except Exception as e:
+        print("   ⚠️ Jina 抓取失败: {}，尝试直接抓取".format(e))
+
+    # 降级：直接抓取 HTML，提取正文
+    try:
+        resp = fetch_with_retry(url, timeout=20)
+        # 简单提取：去掉 script/style，取 body 文本
+        html = resp.text
+        html = re.sub(r"<script[^>]*>.*?</script>", "", html, flags=re.DOTALL)
+        html = re.sub(r"<style[^>]*>.*?</style>", "", html, flags=re.DOTALL)
+        html = re.sub(r"<[^>]+>", " ", html)
+        text = re.sub(r"\s+", " ", html).strip()
+        if len(text) > 50:
+            print("    直接抓取成功 ({} chars)".format(len(text)))
+            return text[:10000]
+    except Exception as e:
+        print("   ❌ 正文抓取失败: {}".format(e))
+
+    return ""
+
+def generate_summary(content, title):
+    """调用 LLM 生成文章摘要"""
+    if not LLM_API_KEY:
+        return ""
+
+    prompt = "你是 AI 领域的专业编辑。请为以下文章生成一段 100-200 字的中文摘要，概括核心内容、关键信息和影响。\n\n文章标题: {}\n\n文章内容:\n{}\n\n摘要:".format(
+        title, content[:5000]
+    )
+
+    try:
+        resp = requests.post(
+            "{}/chat/completions".format(LLM_BASE_URL.rstrip("/")),
+            headers={
+                "Authorization": "Bearer {}".format(LLM_API_KEY),
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": LLM_MODEL,
+                "messages": [
+                    {"role": "system", "content": "你是一个专业的科技新闻编辑，擅长用简洁的中文概括技术文章的核心要点。"},
+                    {"role": "user", "content": prompt}
+                ],
+                "temperature": 0.3,
+                "max_tokens": 500,
+            },
+            timeout=30,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            summary = data["choices"][0]["message"]["content"].strip()
+            print("   🤖 摘要生成成功 ({} chars)".format(len(summary)))
+            return summary[:SUMMARY_MAX_CHARS]
+        else:
+            print("   ⚠️ LLM 调用失败: HTTP {} {}".format(resp.status_code, resp.text[:200]))
+    except Exception as e:
+        print("   ⚠️ LLM 调用异常: {}".format(e))
+
+    return ""
+
+def create_notion_page(title, source, url, summary=""):
     try:
         properties = {
             "Title": {
@@ -125,6 +209,19 @@ def create_notion_page(title, source, url):
                 }
             }
         }
+
+        # 如果有摘要，写入 Summary 字段
+        if summary:
+            properties["Summary"] = {
+                "rich_text": [
+                    {
+                        "text": {
+                            "content": summary
+                        }
+                    }
+                ]
+            }
+
         response = notion.pages.create(
             parent={"database_id": NOTION_DATABASE_ID},
             properties=properties
@@ -137,10 +234,11 @@ def create_notion_page(title, source, url):
         return False
 
 def main():
-    print("🚀 开始同步Anthropic新闻到Notion")
+    print("🚀 开始同步 Anthropic 新闻到 Notion")
     print("=" * 50)
     total_synced = 0
     total_skipped = 0
+    total_failed = 0
     for source in SOURCES:
         articles = fetch_source_articles(source)
         for title, url in articles:
@@ -148,11 +246,29 @@ def main():
                 print("ℹ️  已存在，跳过: {}".format(title))
                 total_skipped += 1
                 continue
-            if create_notion_page(title, source, url):
+
+            # 1. 抓取正文
+            content = fetch_article_content(url)
+
+            # 2. 生成摘要
+            summary = ""
+            if content:
+                print("   🔄 正在生成摘要...")
+                summary = generate_summary(content, title)
+
+            # 3. 写入 Notion
+            if create_notion_page(title, source, url, summary):
                 total_synced += 1
+            else:
+                total_failed += 1
+
+            # 避免请求过快
+            time.sleep(1)
+
     print("\n" + "=" * 50)
     print("🎉 全部同步完成！")
     print("✅ 新增: {} 篇资讯".format(total_synced))
+    print(" 失败: {} 篇".format(total_failed))
     print("ℹ️  跳过: {} 篇（已存在）".format(total_skipped))
 
 if __name__ == "__main__":
