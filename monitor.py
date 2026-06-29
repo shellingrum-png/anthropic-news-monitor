@@ -119,7 +119,7 @@ def create_notion_page(title, source, url):
                     "name": "To Read"
                 }
             },
-            "Date Added": {
+            "Date": {
                 "date": {
                     "start": datetime.now().isoformat()
                 }
