@@ -140,13 +140,31 @@ def fetch_article_content(url):
     return ""
 
 def generate_summary(content, title):
-    """调用 LLM 生成文章摘要"""
+    """调用 LLM 生成结构化文章摘要"""
     if not LLM_API_KEY:
         return ""
 
-    prompt = "你是 AI 领域的专业编辑。请为以下文章生成一段 100-200 字的中文摘要，概括核心内容、关键信息和影响。\n\n文章标题: {}\n\n文章内容:\n{}\n\n摘要:".format(
-        title, content[:5000]
-    )
+    prompt = """你是 AI 领域的专业编辑。请为以下文章生成结构化的中文摘要。
+
+严格按照以下格式输出：
+
+1. 核心摘要（150字以内）
+[用1-2句话概括文章的核心内容]
+
+2. 关键技术点或产品亮点（3-5条）
+- **[要点标题]**：[具体说明]
+- **[要点标题]**：[具体说明]
+- **[要点标题]**：[具体说明]
+
+3. 对行业的影响或意义（50字以内）
+[一句话总结影响或意义]
+
+文章标题: {title}
+
+文章内容:
+{content}
+
+请按上述格式输出摘要：""".format(title=title, content=content[:5000])
 
     try:
         resp = requests.post(
@@ -158,13 +176,13 @@ def generate_summary(content, title):
             json={
                 "model": LLM_MODEL,
                 "messages": [
-                    {"role": "system", "content": "你是一个专业的科技新闻编辑，擅长用简洁的中文概括技术文章的核心要点。"},
+                    {"role": "system", "content": "你是一个专业的科技新闻编辑，擅长用简洁的中文概括技术文章的核心要点，并按照结构化格式输出摘要。"},
                     {"role": "user", "content": prompt}
                 ],
                 "temperature": 0.3,
-                "max_tokens": 500,
+                "max_tokens": 1500,
             },
-            timeout=30,
+            timeout=60,
         )
         if resp.status_code == 200:
             data = resp.json()
