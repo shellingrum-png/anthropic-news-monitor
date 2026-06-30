@@ -33,4 +33,7 @@ jobs:
         LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
         LLM_MODEL: ${{ secrets.LLM_MODEL }}
         LLM_API_FORMAT: ${{ secrets.LLM_API_FORMAT }}
+        QQ_EMAIL: ${{ secrets.QQ_EMAIL }}
+        QQ_IMAP_PASSWORD: ${{ secrets.QQ_IMAP_PASSWORD }}
+        QQ_IMAP_SERVER: ${{ secrets.QQ_IMAP_SERVER }}
       run: python monitor.py
