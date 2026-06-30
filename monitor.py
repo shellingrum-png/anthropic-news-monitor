@@ -120,6 +120,11 @@ def fetch_source_articles(source):
         url = m.group(2).split("?")[0]
         if len(title) < 5 or len(title) > 200 or url.startswith("#") or ".png" in url or ".jpg" in url or ".gif" in url or "mailto:" in url or "javascript:" in url or "tel:" in url:
             continue
+        # 过滤纯图片/无意义标题
+        if re.match(r'^!?image\s*\d*', title, re.IGNORECASE):
+            continue
+        if title.startswith("!") or title.lower().startswith("image"):
+            continue
         if url not in seen_urls:
             articles.append((title, url))
             seen_urls.add(url)
@@ -224,8 +229,29 @@ def fetch_qq_email_articles():
 # ═══════════════════════════════════════════
 
 def analyze_article(article_url):
-    """抓取文章正文并调用 LLM 分析"""
-    article_content = requests.get(f"https://r.jina.ai/{article_url}", timeout=30).text
+    """抓取文章正文并调用 LLM 分析。返回 None 表示内容无效（403/无正文等），应跳过入库"""
+    resp = requests.get(f"https://r.jina.ai/{article_url}", timeout=30)
+    if resp.status_code != 200:
+        print(f"     Jina 抓取失败: HTTP {resp.status_code}")
+        return None
+
+    article_content = resp.text.strip()
+
+    # 检测 403/404/反爬 等无效内容
+    error_patterns = [
+        "403", "404", "401", "Access Denied", "访问受限", "Forbidden",
+        "openresty", "Ray ID", "cf-error", "captcha", "验证", "人机验证",
+        "just a moment", "cloudflare", "security check",
+    ]
+    if any(p in article_content for p in error_patterns):
+        print(f"    ⛔ 内容被反爬拦截 (403/Cloudflare)，跳过")
+        return None
+
+    # 检测是否为纯图片/空内容
+    if len(article_content) < 100:
+        print(f"    ⛔ 正文过短 ({len(article_content)} chars)，跳过")
+        return None
+
     if len(article_content) > 15000:
         article_content = article_content[:15000] + "\n\n[内容已截断...]"
 
@@ -309,12 +335,15 @@ def main():
             print(f"    🆕 新文章: {title[:50]}")
             try:
                 summary = analyze_article(url)
+                if summary is None:
+                    print(f"    ⏭️ 内容无效，跳过: {title[:50]}")
+                    continue
                 if write_to_notion(title, url, summary, source=source["name"]):
                     total_new += 1
                 else:
                     total_failed += 1
             except Exception as e:
-                print(f"    ❌ 处理失败: {e}")
+                print(f"     处理失败: {e}")
                 total_failed += 1
             time.sleep(1)
 
@@ -334,6 +363,9 @@ def main():
             # 如果有 URL，抓取正文分析；否则直接用邮件标题分析
             if url:
                 summary = analyze_article(url)
+                if summary is None:
+                    print(f"    ⏭️ 链接内容无效，跳过: {title[:50]}")
+                    continue
             else:
                 summary = analyze_email_content(title, "")
             if write_to_notion(display_title, url or f"email://{title}", summary, source="QQ邮箱", is_email=True):
@@ -341,7 +373,7 @@ def main():
             else:
                 total_failed += 1
         except Exception as e:
-            print(f"    ❌ 处理失败: {e}")
+            print(f"     处理失败: {e}")
             total_failed += 1
         time.sleep(1)
 
