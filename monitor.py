@@ -1,5 +1,5 @@
 """
-AI News Monitor - 多源 AI 新闻抓取 + QQ邮箱【爆点】推送，AI 分析后写入 Notion
+AI News Monitor - 多源 AI 新闻源抓取 + QQ邮箱【爆点】推送，AI 分析后写入 Notion
 """
 import os
 import re
@@ -43,6 +43,107 @@ SOURCES = [
     {"name": "量子位", "url": "https://www.qbitai.com"},
     {"name": "机器之心", "url": "https://www.jiqizhixin.com"},
 ]
+
+# ── 导航/页脚噪声标题黑名单 ──
+NAVIGATION_BLOCKLIST = [
+    # 通用导航
+    "skip to main content", "skip to content", "skip to footer", "skip navigation",
+    "main content", "footer", "header", "navigation",
+    # Anthropic
+    "research", "policy", "try claude", "about", "careers", "safety",
+    "try claude enterprise", "claude", "anthropic",
+    # OpenAI
+    "core", "products", "safety", "company",
+    # DeepMind
+    "explore models", "explore", "evals", "publications", "blog",
+    "about us", "about google deepmind", "our technology", "impact",
+    # TLDR
+    "one daily email", "subscribe", "signup", "login",
+    # The Batch
+    "the batch", "deeplearning.ai",
+    # 量子位/机器之心
+    "首页", "导航", "菜单", "搜索", "登录", "注册",
+    "关注我们", "关于我们", "联系方式",
+    # 通用
+    "read more", "learn more", "view all", "see all",
+    "contact us", "privacy policy", "terms of service",
+    "cookie policy", "accessibility",
+]
+
+# 日期模式：如 "Jun 26, 2026", "2026-06-26", "June 26" 等
+DATE_ONLY_PATTERN = re.compile(
+    r'^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*\s+\d{1,2},?\s*\d{4}$',
+    re.IGNORECASE
+)
+
+# ── 各源的文章 URL 模式（用于验证是否为真实文章） ──
+# 只有匹配到这些模式的 URL 才会被当作文章
+SOURCE_URL_PATTERNS = {
+    "Anthropic": [
+        r"anthropic\.com/news/",           # 文章页
+    ],
+    "OpenAI": [
+        r"openai\.com/(research|news|index)/",  # 文章/研究页
+    ],
+    "Google DeepMind": [
+        r"deepmind\.google/discover/blog/",
+        r"deepmind\.google/research/",
+        r"deepmind\.google/technology/",
+    ],
+    "TLDR AI": [
+        r"tldr\.tech/ai/\d+",              # 日期路径文章
+    ],
+    "The Batch (吴恩达)": [
+        r"deeplearning\.ai/the-batch/",
+        r"deeplearning\.ai/batch-\d+",
+    ],
+    "量子位": [
+        r"qbitai\.com/\d+\.html",          # 数字ID文章
+        r"qbitai\.com/20\d{2}/\d+/",       # 日期路径
+    ],
+    "机器之心": [
+        r"jiqizhixin\.com/articles/",
+        r"jiqizhixin\.com/20\d{2}/\d+/",
+    ],
+}
+
+
+# ═══════════════════════════════════════════
+#  标题验证工具
+# ═══════════════════════════════════════════
+
+def _is_valid_article_title(title, url):
+    """
+    判断一个 (title, url) 是否为真实文章而非导航/噪声。
+    返回 True 表示是有效文章。
+    """
+    title_lower = title.lower().strip()
+
+    # 1. 黑名单匹配
+    if title_lower in NAVIGATION_BLOCKLIST:
+        return False
+
+    # 2. 纯日期标题
+    if DATE_ONLY_PATTERN.match(title):
+        return False
+
+    # 3. 仅包含标点/数字/括号的无效标题
+    if re.match(r'^[\d\s\(\)\-\:\.\,一-鿿]+$', title) and len(title) < 20:
+        return False
+
+    # 4. 源特定 URL 模式验证
+    # 如果当前 URL 不匹配该源的任何文章模式，则跳过
+    # 这能过滤掉 "Research", "Policy" 等导航页链接
+    url_matched = False
+    for source_name, patterns in SOURCE_URL_PATTERNS.items():
+        for pattern in patterns:
+            if re.search(pattern, url):
+                url_matched = True
+                break
+        if url_matched:
+            break
+
+    return url_matched
 
 
 # ═══════════════════════════════════════════
@@ -95,22 +196,32 @@ def write_to_notion(title, url, summary, source="", is_email=False):
 
 
 # ═══════════════════════════════════════════
-#  新闻源抓取（Jina AI Reader）
+#  新闻源抓取（Jina AI Reader + 备用直抓）
 # ═══════════════════════════════════════════
 
 def fetch_source_articles(source):
     """抓取单个源的文章列表"""
     jina_url = f"https://r.jina.ai/{source['url']}"
+    raw_text = None
+
     try:
         response = requests.get(jina_url, timeout=30)
-        if response.status_code != 200:
-            print(f"   抓取失败 {source['name']}: HTTP {response.status_code}")
-            return []
-    except requests.RequestException as e:
-        print(f"   抓取失败 {source['name']}: {e}")
-        return []
+        if response.status_code == 200 and len(response.text.strip()) > 200:
+            raw_text = response.text
+            # 检测 Jina 返回的是否为错误/空页面
+            error_signs = ["just a moment", "cloudflare", "captcha", "access denied", "openresty"]
+            if any(s in raw_text.lower() for s in error_signs):
+                raw_text = None
+    except requests.RequestException:
+        pass
 
-    raw_text = response.text
+    # Jina 失败时的备用方案：直接请求 + HTML 解析
+    if not raw_text:
+        raw_text = _fetch_source_direct(source)
+        if not raw_text:
+            print(f"   ⚠️ {source['name']}: 所有抓取方式均失败，跳过")
+            return []
+
     articles = []
     seen_urls = set()
 
@@ -118,13 +229,10 @@ def fetch_source_articles(source):
     for m in re.finditer(r'\[([^\]]{3,})\]\((https?://[^\s)]+)\)', raw_text):
         title = m.group(1).strip()
         url = m.group(2).split("?")[0]
-        if len(title) < 5 or len(title) > 200 or url.startswith("#") or ".png" in url or ".jpg" in url or ".gif" in url or "mailto:" in url or "javascript:" in url or "tel:" in url:
+
+        if not _is_valid_article_title(title, url):
             continue
-        # 过滤纯图片/无意义标题
-        if re.match(r'^!?image\s*\d*', title, re.IGNORECASE):
-            continue
-        if title.startswith("!") or title.lower().startswith("image"):
-            continue
+
         if url not in seen_urls:
             articles.append((title, url))
             seen_urls.add(url)
@@ -133,14 +241,75 @@ def fetch_source_articles(source):
     if not articles:
         for m in re.finditer(r"https://[a-z0-9.-]+\.[a-z]{2,}(/[^\s\"')]+)?", raw_text):
             url = m.group(0)
+            if not _is_valid_article_title("", url):
+                continue
             if any(skip in url for skip in [".png", ".jpg", ".gif", "mailto:", "javascript:"]):
                 continue
             title = url.split("/")[-1].replace("-", " ").replace("_", " ")
+            if len(title) < 5:
+                continue
             if url not in seen_urls:
                 articles.append((title, url))
                 seen_urls.add(url)
 
     return articles[:MAX_ARTICLES_PER_SOURCE]
+
+
+def _fetch_source_direct(source):
+    """
+    备用抓取：直接请求页面并解析 HTML（当 Jina 失败时）。
+    目前仅对 Anthropic 和 OpenAI 有效（SSR 渲染，HTML 中包含文章链接）。
+    返回 markdown 格式文本以便复用现有解析逻辑。
+    """
+    source_name = source["name"]
+    url = source["url"]
+
+    try:
+        resp = requests.get(url, timeout=30, headers={
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        })
+    except requests.RequestException:
+        return None
+
+    if resp.status_code != 200:
+        return None
+
+    html = resp.text
+    markdown_lines = []
+
+    if source_name == "Anthropic":
+        # Anthropic news 页面：Next.js SSR，HTML 中包含 /news/xxx 链接
+        links = re.findall(r'href="(/news/[^"]+)"', html)
+        seen = set()
+        for path in links:
+            if path in seen:
+                continue
+            seen.add(path)
+            # 尝试从 HTML 中提取标题
+            # 通常结构：<a href="/news/xxx">Title</a>
+            title_match = re.search(rf'<a[^>]*href="{re.escape(path)}"[^>]*>(.*?)</a>', html)
+            if title_match:
+                title = re.sub(r'<[^>]+>', '', title_match.group(1)).strip()
+                if title and len(title) > 3:
+                    full_url = f"https://www.anthropic.com{path}"
+                    markdown_lines.append(f"[{title}]({full_url})")
+
+    elif source_name == "OpenAI":
+        # OpenAI news 页面
+        links = re.findall(r'href="(/(?:research|news)/[^"]+)"', html)
+        seen = set()
+        for path in links:
+            if path in seen:
+                continue
+            seen.add(path)
+            title_match = re.search(rf'<a[^>]*href="{re.escape(path)}"[^>]*>(.*?)</a>', html)
+            if title_match:
+                title = re.sub(r'<[^>]+>', '', title_match.group(1)).strip()
+                if title and len(title) > 3:
+                    full_url = f"https://openai.com{path}"
+                    markdown_lines.append(f"[{title}]({full_url})")
+
+    return "\n".join(markdown_lines) if markdown_lines else None
 
 
 # ═══════════════════════════════════════════
@@ -230,12 +399,27 @@ def fetch_qq_email_articles():
 
 def analyze_article(article_url):
     """抓取文章正文并调用 LLM 分析。返回 None 表示内容无效（403/无正文等），应跳过入库"""
+    # 先用 Jina 抓取
     resp = requests.get(f"https://r.jina.ai/{article_url}", timeout=30)
     if resp.status_code != 200:
-        print(f"     Jina 抓取失败: HTTP {resp.status_code}")
-        return None
-
-    article_content = resp.text.strip()
+        print(f"     Jina 抓取失败: HTTP {resp.status_code}，尝试直接抓取")
+        # 备用：直接抓取原始 URL
+        try:
+            resp2 = requests.get(article_url, timeout=30, headers={
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            })
+            if resp2.status_code == 200:
+                # 用简单方法提取文本
+                article_content = re.sub(r'<[^>]+>', ' ', resp2.text)
+                article_content = re.sub(r'\s+', ' ', article_content).strip()
+            else:
+                print(f"     直接抓取也失败: HTTP {resp2.status_code}")
+                return None
+        except requests.RequestException as e:
+            print(f"     直接抓取异常: {e}")
+            return None
+    else:
+        article_content = resp.text.strip()
 
     # 检测 403/404/反爬 等无效内容
     error_patterns = [
@@ -347,7 +531,7 @@ def main():
                 total_failed += 1
             time.sleep(1)
 
-    # ── 2. 抓取 QQ 邮箱爆点
+    # ── 2. 抓取 QQ 邮箱爆点 ──
     print("\n" + "=" * 50)
     print("📧 开始抓取 QQ 邮箱爆点推送")
     print("=" * 50)
