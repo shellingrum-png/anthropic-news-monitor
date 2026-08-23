@@ -9,6 +9,7 @@ import email
 import email.header
 from datetime import datetime, timezone, timedelta
 import requests
+import xml.etree.ElementTree as ET
 
 # ── 环境变量 ──
 NOTION_TOKEN = os.environ.get("NOTION_TOKEN", "")
@@ -38,10 +39,10 @@ SOURCES = [
     {"name": "Anthropic", "url": "https://www.anthropic.com/news"},
     {"name": "OpenAI", "url": "https://openai.com/news"},
     {"name": "Google DeepMind", "url": "https://deepmind.google/discover"},
-    {"name": "TLDR AI", "url": "https://tldr.tech/ai"},
     {"name": "The Batch (吴恩达)", "url": "https://www.deeplearning.ai/the-batch"},
     {"name": "量子位", "url": "https://www.qbitai.com"},
-    {"name": "机器之心", "url": "https://www.jiqizhixin.com"},
+    {"name": "TechCrunch AI", "url": "https://techcrunch.com/category/artificial-intelligence/"},
+    {"name": "The Verge AI", "url": "https://www.theverge.com/ai-artificial-intelligence"},
 ]
 
 # ── 导航/页脚噪声标题黑名单 ──
@@ -89,6 +90,8 @@ SOURCE_URL_PATTERNS = {
         r"deepmind\.google/discover/blog/",
         r"deepmind\.google/research/",
         r"deepmind\.google/technology/",
+        r"blog\.google/innovation-and-ai/models-and-research/.*deepmind",
+        r"blog\.google/innovation-and-ai/models-and-research/gemini",
     ],
     "TLDR AI": [
         r"tldr\.tech/ai/\d+",              # 日期路径文章
@@ -105,6 +108,25 @@ SOURCE_URL_PATTERNS = {
         r"jiqizhixin\.com/articles/",
         r"jiqizhixin\.com/20\d{2}/\d+/",
     ],
+    "TechCrunch AI": [
+        r"techcrunch\.com/\d{4}/",
+        r"techcrunch\.com/category/artificial-intelligence/",
+    ],
+    "The Verge AI": [
+        r"theverge\.com/ai-artificial-intelligence/",
+        r"theverge\.com/\d{4}/",
+    ],
+}
+
+# ── 各源 RSS/Atom feed URL（优先于 Jina/直接抓取） ──
+RSS_FEED_URLS = {
+    "Anthropic": None,
+    "OpenAI": "https://openai.com/blog/rss.xml",
+    "Google DeepMind": "https://blog.google/innovation-and-ai/models-and-research/google-deepmind/rss",
+    "量子位": "https://www.qbitai.com/feed",
+    "TechCrunch AI": "https://techcrunch.com/category/artificial-intelligence/feed/",
+    "The Verge AI": "https://www.theverge.com/rss/ai-artificial-intelligence/index.xml",
+    "The Batch (吴恩达)": None,
 }
 
 
@@ -196,11 +218,80 @@ def write_to_notion(title, url, summary, source="", is_email=False):
 
 
 # ═══════════════════════════════════════════
-#  新闻源抓取（Jina AI Reader + 备用直抓）
+#  RSS / Atom feed 抓取
+# ═══════════════════════════════════════════
+
+def _fetch_rss_feed(source_name, feed_url):
+    """
+    从 RSS/Atom feed 抓取文章列表。
+    同时支持 RSS 2.0（<item><link>）和 Atom（<entry><link href=>）两种格式。
+    """
+    try:
+        resp = requests.get(feed_url, timeout=30, headers={
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                          "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        })
+        if resp.status_code != 200:
+            return None
+    except requests.RequestException:
+        return None
+
+    articles = []
+    seen_urls = set()
+
+    # ── RSS 2.0 格式：用正则解析（避免 XML 命名空间问题） ──
+    for m in re.finditer(r'<item>(.*?)</item>', resp.text, re.DOTALL):
+        block = m.group(1)
+        title_m = re.search(r'<title[^>]*>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</title>', block, re.DOTALL)
+        url_m = re.search(r'<link>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</link>', block)
+        if not title_m or not url_m:
+            continue
+        title = re.sub(r'<[^>]+>', '', title_m.group(1)).strip()
+        url = url_m.group(1).strip()
+        if title and url and url not in seen_urls and len(title) > 3:
+            articles.append((title, url))
+            seen_urls.add(url)
+        if len(articles) >= MAX_ARTICLES_PER_SOURCE:
+            return articles
+
+    # ── Atom 格式：用正则解析（<entry> + <link rel="alternate" href="...">） ──
+    if not articles:
+        for m in re.finditer(r'<entry>(.*?)</entry>', resp.text, re.DOTALL):
+            block = m.group(1)
+            title_m = re.search(r'<title[^>]*>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</title>', block, re.DOTALL)
+            url_m = re.search(r'<link[^>]+rel=["\']alternate["\'][^>]+href=["\']([^"\']+)["\']', block)
+            if not url_m:
+                url_m = re.search(r'<link[^>]+href=["\']([^"\']+)["\']', block)
+            if not title_m or not url_m:
+                continue
+            title = re.sub(r'<[^>]+>', '', title_m.group(1)).strip()
+            url = url_m.group(1).strip()
+            if title and url and url not in seen_urls and len(title) > 3:
+                articles.append((title, url))
+                seen_urls.add(url)
+            if len(articles) >= MAX_ARTICLES_PER_SOURCE:
+                return articles
+
+    return articles if articles else None
+
+
+# ═══════════════════════════════════════════
+#  新闻源抓取（RSS → Jina AI Reader → 备用直抓）
 # ═══════════════════════════════════════════
 
 def fetch_source_articles(source):
-    """抓取单个源的文章列表"""
+    """抓取单个源的文章列表。优先走 RSS feed，失败再走 Jina，最后直接抓 HTML"""
+    # ── 0. RSS feed 优先（最稳定，不受 Cloudflare 影响） ──
+    feed_url = RSS_FEED_URLS.get(source["name"])
+    if feed_url:
+        rss_articles = _fetch_rss_feed(source["name"], feed_url)
+        if rss_articles:
+            print(f"   📡 RSS feed 成功，获取 {len(rss_articles)} 篇")
+            return rss_articles
+        else:
+            print(f"   ⚠️ RSS feed 失败，回退到 Jina/直接抓取")
+
+    # ── 1. Jina AI Reader ──
     jina_url = f"https://r.jina.ai/{source['url']}"
     raw_text = None
 
@@ -308,6 +399,64 @@ def _fetch_source_direct(source):
                 if title and len(title) > 3:
                     full_url = f"https://openai.com{path}"
                     markdown_lines.append(f"[{title}]({full_url})")
+
+    elif source_name == "Google DeepMind":
+        # DeepMind discover 页面：Next.js SSR，包含 /discover/blog/xxx 相对链接
+        links = re.findall(r'href="((?:https://deepmind\.google)?/discover/blog/[^"#?]+)"', html)
+        seen = set()
+        for link in links:
+            # 统一转成绝对路径
+            if link.startswith("/"):
+                full_url = f"https://deepmind.google{link}"
+            else:
+                full_url = link
+            # 去掉 utm 参数
+            full_url = full_url.split("?")[0]
+            if full_url in seen:
+                continue
+            seen.add(full_url)
+            # 提取标题
+            path_escaped = re.escape(link)
+            title_match = re.search(rf'<a[^>]*href="{path_escaped}"[^>]*>(.*?)</a>', html, re.DOTALL)
+            if title_match:
+                title = re.sub(r'<[^>]+>', '', title_match.group(1)).strip()
+                if title and len(title) > 3:
+                    markdown_lines.append(f"[{title}]({full_url})")
+
+    elif source_name == "The Batch (吴恩达)":
+        # deeplearning.ai The Batch 页面：
+        # 文章链接是覆盖层 <a>，标题在 aria-label 属性里
+        # 格式：<a class="absolute inset-0" aria-label="TITLE" href="/the-batch/issue-367"></a>
+        matches = re.findall(
+            r'<a[^>]+aria-label="([^"]+)"[^>]+href="(/the-batch/[^"]+)"[^>]*>',
+            html
+        )
+        # 也尝试反向顺序（href 在 aria-label 前面）
+        matches += re.findall(
+            r'<a[^>]+href="(/the-batch/[^"]+)"[^>]+aria-label="([^"]+)"[^>]*>',
+            html
+        )
+        seen = set()
+        for m in matches:
+            # 统一格式 (title, path)
+            if m[0].startswith("/"):
+                path, title = m[1], m[0]
+            else:
+                title, path = m[0], m[1]
+            # 跳过非文章页
+            if path in ("/the-batch", "/the-batch/") or "/tag/" in path:
+                continue
+            if path.endswith("/about") or path.endswith("/search"):
+                continue
+            if "/page/" in path:
+                continue
+            if path in seen:
+                continue
+            seen.add(path)
+            title = title.strip()
+            if title and len(title) > 3:
+                full_url = f"https://www.deeplearning.ai{path}"
+                markdown_lines.append(f"[{title}]({full_url})")
 
     return "\n".join(markdown_lines) if markdown_lines else None
 
@@ -568,6 +717,11 @@ def main():
     print(f"⏭️  跳过: {total_seen} 篇（已存在）")
     print(f"❌ 失败: {total_failed} 篇")
     print("=" * 50)
+
+    # 全部失败（有新文章但全写不进去）时返回非 0，让 GitHub Actions 显示失败
+    if total_new == 0 and total_failed > 0:
+        import sys
+        sys.exit(1)
 
 
 if __name__ == "__main__":
