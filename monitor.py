@@ -221,10 +221,15 @@ def write_to_notion(title, url, summary, source="", is_email=False):
 #  RSS / Atom feed 抓取
 # ═══════════════════════════════════════════
 
+# ── RSS 文章的描述缓存（URL → 描述文本），Jina 抓正文失败时作为 fallback ──
+_rss_descriptions = {}
+
+
 def _fetch_rss_feed(source_name, feed_url):
     """
     从 RSS/Atom feed 抓取文章列表。
     同时支持 RSS 2.0（<item><link>）和 Atom（<entry><link href=>）两种格式。
+    同时提取 description/content 存入 _rss_descriptions 供 fallback。
     """
     try:
         resp = requests.get(feed_url, timeout=30, headers={
@@ -251,6 +256,19 @@ def _fetch_rss_feed(source_name, feed_url):
         if title and url and url not in seen_urls and len(title) > 3:
             articles.append((title, url))
             seen_urls.add(url)
+            # 提取 description / content:encoded 作为 fallback
+            desc_m = re.search(r'<description>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</description>', block, re.DOTALL)
+            content_m = re.search(r'<content:encoded>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</content:encoded>', block, re.DOTALL)
+            raw_desc = ""
+            if content_m:
+                raw_desc = content_m.group(1)
+            elif desc_m:
+                raw_desc = desc_m.group(1)
+            if raw_desc:
+                clean = re.sub(r'<[^>]+>', ' ', raw_desc)
+                clean = re.sub(r'\s+', ' ', clean).strip()
+                if len(clean) > 30:
+                    _rss_descriptions[url] = clean
         if len(articles) >= MAX_ARTICLES_PER_SOURCE:
             return articles
 
@@ -269,6 +287,19 @@ def _fetch_rss_feed(source_name, feed_url):
             if title and url and url not in seen_urls and len(title) > 3:
                 articles.append((title, url))
                 seen_urls.add(url)
+                # 提取 summary / content 作为 fallback
+                desc_m = re.search(r'<summary[^>]*>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</summary>', block, re.DOTALL)
+                content_m = re.search(r'<content[^>]*>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</content>', block, re.DOTALL)
+                raw_desc = ""
+                if content_m:
+                    raw_desc = content_m.group(1)
+                elif desc_m:
+                    raw_desc = desc_m.group(1)
+                if raw_desc:
+                    clean = re.sub(r'<[^>]+>', ' ', raw_desc)
+                    clean = re.sub(r'\s+', ' ', clean).strip()
+                    if len(clean) > 30:
+                        _rss_descriptions[url] = clean
             if len(articles) >= MAX_ARTICLES_PER_SOURCE:
                 return articles
 
@@ -546,8 +577,9 @@ def fetch_qq_email_articles():
 #  LLM 分析
 # ═══════════════════════════════════════════
 
-def analyze_article(article_url):
-    """抓取文章正文并调用 LLM 分析。返回 None 表示内容无效（403/无正文等），应跳过入库"""
+def analyze_article(article_url, rss_fallback_text=None):
+    """抓取文章正文并调用 LLM 分析。返回 None 表示内容无效（403/无正文等），应跳过入库。
+    如果 Jina/直接抓取均失败，且有 rss_fallback_text（来自 RSS description），则用 fallback 分析。"""
     # 先用 Jina 抓取
     resp = requests.get(f"https://r.jina.ai/{article_url}", timeout=30)
     if resp.status_code != 200:
@@ -563,10 +595,10 @@ def analyze_article(article_url):
                 article_content = re.sub(r'\s+', ' ', article_content).strip()
             else:
                 print(f"     直接抓取也失败: HTTP {resp2.status_code}")
-                return None
+                article_content = None
         except requests.RequestException as e:
             print(f"     直接抓取异常: {e}")
-            return None
+            article_content = None
     else:
         article_content = resp.text.strip()
 
@@ -576,13 +608,18 @@ def analyze_article(article_url):
         "openresty", "Ray ID", "cf-error", "captcha", "验证", "人机验证",
         "just a moment", "cloudflare", "security check",
     ]
-    if any(p in article_content for p in error_patterns):
-        print(f"    ⛔ 内容被反爬拦截 (403/Cloudflare)，跳过")
-        return None
+    if article_content and any(p in article_content.lower() for p in error_patterns):
+        print(f"    ⚠️ 内容被反爬拦截，尝试 RSS 摘要 fallback")
+        article_content = None
 
-    # 检测是否为纯图片/空内容
-    if len(article_content) < 100:
-        print(f"    ⛔ 正文过短 ({len(article_content)} chars)，跳过")
+    # 正文无效时，使用 RSS 描述作为 fallback
+    if (not article_content or len(article_content) < 100) and rss_fallback_text:
+        print(f"    📡 使用 RSS 摘要作为内容来源 ({len(rss_fallback_text)} chars)")
+        article_content = rss_fallback_text
+
+    # 最终仍无内容，跳过
+    if not article_content or len(article_content) < 100:
+        print(f"    ⛔ 无可用内容，跳过")
         return None
 
     if len(article_content) > 15000:
@@ -667,7 +704,8 @@ def main():
                 continue
             print(f"    🆕 新文章: {title[:50]}")
             try:
-                summary = analyze_article(url)
+                fallback = _rss_descriptions.get(url)
+                summary = analyze_article(url, rss_fallback_text=fallback)
                 if summary is None:
                     print(f"    ⏭️ 内容无效，跳过: {title[:50]}")
                     continue
